@@ -1,0 +1,133 @@
+---
+- name: Upgrade ceph cluster
+  vars:
+    health_osd_check_retries: 9999999
+    health_osd_check_delay: 10
+    upgrade_ceph_packages: true
+    cluster: ceph
+  hosts: "{{ osd_group_name|default('osds') }}"
+  tags: osds
+  serial: 1
+  become: true
+  gather_facts: true
+  tasks:
+    - name: Upgrade to 20.04
+      block:
+      - name: Get local ceph osd number
+        ansible.builtin.command: "ceph osd crush ls {{ ansible_facts['hostname'] }}"
+        register: local_osd_id
+
+      - name: Set new memory tunning profile
+        ansible.builtin.command: "ceph config set {{ item }} osd_memory_target_autotune true"
+        loop: "{{ local_osd_id.stdout_lines }}"
+
+      - name: Set new memory tunning profile
+        ansible.builtin.command: "ceph config set {{ item }} bluestore_rocksdb_options compression=kNoCompression,max_write_buffer_number=128,min_write_buffer_number_to_merge=16,compaction_style=kCompactionStyleLevel,write_buffer_size=8388608,max_background_jobs=4,level0_file_num_compaction_trigger=8,max_bytes_for_level_base=1073741824,max_bytes_for_level_multiplier=8,compaction_readahead_size=2MB,max_total_wal_size=1073741824,writable_file_max_buffer_size=0"
+        loop: "{{ local_osd_id.stdout_lines }}"
+
+      - name: Update all packages
+        ansible.builtin.apt:
+          upgrade: dist
+          update_cache: true
+          dpkg_options: 'force-confold,force-confdef'
+
+      - name: Remove grub-pc
+        ansible.builtin.apt:
+          name: grub-pc
+          state: absent
+          purge: true
+          dpkg_options: 'force-confold,force-confdef'
+
+      - name: Install update-manager-core
+        ansible.builtin.apt:
+          name: update-manager-core,grub-efi,grub-pc-bin,linux-tools-generic,linux-cloud-tools-generic,tuned
+          state: present
+          install_recommends: true
+
+      - name: Correct Grub config options
+        ansible.builtin.lineinfile:
+          path: /etc/default/grub
+          regexp: '^GRUB_CMDLINE_LINUX='
+          line: 'GRUB_CMDLINE_LINUX="net.ifnames=0 biosdevname=0 processor.max_cstate=1 intel_idle.max_cstate=0"'
+
+      - name: Force non-interactive for dpkg
+        ansible.builtin.lineinfile:
+          name: /etc/apt/apt.conf.d/20-non-interactive
+          line: 'DPkg::options { "--force-confdef"; };'
+          create: true
+          state: present
+
+      - name: Allow third party mirrors part 1
+        ansible.builtin.lineinfile:
+          name: /etc/update-manager/release-upgrades.d/ubuntu-advantage-upgrades.cfg
+          line: '[ThirdPartyMirrors]'
+          create: true
+          state: present
+
+      - name: Allow third party mirrors part 2
+        ansible.builtin.lineinfile:
+          name: /etc/update-manager/release-upgrades.d/ubuntu-advantage-upgrades.cfg
+          line: 'ceph_pacific_focal=http://download.ceph.com/debian-pacific'
+          create: true
+          state: present
+
+      - name: Ensure update-initramfs works
+        ansible.builtin.copy:
+          src: /usr/sbin/update-initramfs.distrib
+          dest: /usr/sbin/update-initramfs
+          remote_src: true
+        ignore_errors: true
+
+      - name: Perform grub-install
+        ansible.builtin.command: grub-install /dev/sda
+
+      - name: Perform do-release-upgrade
+        ansible.builtin.command: do-release-upgrade -f DistUpgradeViewNonInteractive
+        register: do_release_upgrade_output
+
+      - name: Do-release-update-output
+        ansible.builtin.debug:
+          var: do_release_upgrade_output
+
+      - name: Clean up
+        ansible.builtin.apt:
+          autoremove: true
+
+      - name: Remove non-interactive for dpkg
+        ansible.builtin.lineinfile:
+          name: /etc/apt/apt.conf.d/20-non-interactive
+          line: 'DPkg::options { "--force-confdef"; };'
+          state: absent
+
+      - name: Allow third party mirrors part 1
+        ansible.builtin.lineinfile:
+          name: /etc/update-manager/release-upgrades.d/ubuntu-advantage-upgrades.cfg
+          line: '[ThirdPartyMirrors]'
+          state: absent
+
+      - name: Allow third party mirrors part 2
+        ansible.builtin.lineinfile:
+          name: /etc/update-manager/release-upgrades.d/ubuntu-advantage-upgrades.cfg
+          line: 'ceph_pacific_focal=http://download.ceph.com/debian-pacific'
+          state: absent
+
+      - name: Rebooting! brb.
+        ansible.builtin.reboot:
+          reboot_timeout: 69420
+      
+      - name: ceph volume activate
+        ansible.builtin.command: ceph-volume simple activate --all
+
+      - name: Waiting for clean pgs...
+        command: "{{ container_exec_cmd_update_osd|default('') }} ceph --cluster {{ cluster }} pg stat --format json"
+        register: ceph_health_post
+        until: >
+          (((ceph_health_post.stdout | from_json).pg_summary.num_pg_by_state | length) > 0)
+          and
+          (((ceph_health_post.stdout | from_json).pg_summary.num_pg_by_state | selectattr('name', 'search', '^active\\+clean') | map(attribute='num') | list | sum) == (ceph_health_post.stdout | from_json).pg_summary.num_pgs)
+        delegate_to: "{{ groups[mon_group_name][0] }}"
+        changed_when: false
+        retries: "{{ health_osd_check_retries }}"
+        delay: "{{ health_osd_check_delay }}"
+      when:
+        - (ansible_facts['distribution'] == "Ubuntu" and ansible_facts['distribution_version'] == "18.04")
